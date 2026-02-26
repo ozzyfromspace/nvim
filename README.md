@@ -67,7 +67,7 @@ mv ~/.cache/nvim ~/.cache/nvim.bak
 ### 2. Clone this repository
 
 ```bash
-git clone https://github.com/<your-username>/nvim.git ~/.config/nvim
+git clone https://github.com/ozzyfromspace/nvim.git ~/.config/nvim
 ```
 
 ### 3. Launch Neovim
