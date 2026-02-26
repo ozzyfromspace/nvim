@@ -1,0 +1,15 @@
+# Lazy.nvim lock file (regenerated on plugin install/update)
+# Uncomment the line below if you prefer to pin exact versions via git:
+# !lazy-lock.json
+lazy-lock.json
+
+# Plugin data (managed by Lazy.nvim at runtime)
+plugin/
+
+# Neovim swap / undo / shada
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
