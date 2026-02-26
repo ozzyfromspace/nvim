@@ -50,8 +50,45 @@ Personal Neovim configuration built on [AstroNvim v5](https://astronvim.com/) wi
 | [ripgrep](https://github.com/BurntSushi/ripgrep) | Live grep / file search |
 | [lazygit](https://github.com/jesseduffield/lazygit) | Git UI (mapped to `lg`) |
 | A system clipboard tool | `pbcopy`/`xclip`/`wl-copy` for path-copy keymaps |
-| Node.js | Required by many LSP servers |
+| Node.js (via nvm) | Required by many LSP servers (see below) |
 | Python 3 | Required by debugpy and Python LSPs |
+
+### Node.js setup (important)
+
+Many Mason-managed LSP servers and tools (vtsls, vue-language-server, tailwindcss-language-server, eslint-lsp, prettierd, json-lsp, html-lsp, css-lsp, emmet-ls, yaml-language-server, bash-language-server) are installed via `npm`. If `npm` is not in your PATH, these installations will fail on first launch and flood your notifications with errors.
+
+**Install Node.js via [nvm](https://github.com/nvm-sh/nvm)** (recommended):
+
+```bash
+# macOS (Homebrew)
+brew install nvm
+mkdir -p ~/.nvm
+
+# or via curl (Linux / macOS)
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.4/install.sh | bash
+```
+
+Then install a Node.js version:
+
+```bash
+nvm install --lts
+```
+
+**Critical: make nvm available to non-interactive shells.** Neovim spawns non-interactive shell processes for Mason installs, so nvm must be loaded in both `~/.zshrc` and `~/.zshenv`. Add the following to both files:
+
+```bash
+# Homebrew-installed nvm:
+export NVM_DIR="$HOME/.nvm"
+[ -s "/opt/homebrew/opt/nvm/nvm.sh" ] && \. "/opt/homebrew/opt/nvm/nvm.sh"
+
+# curl-installed nvm:
+# export NVM_DIR="$([ -z "${XDG_CONFIG_HOME-}" ] && printf %s "${HOME}/.nvm" || printf %s "${XDG_CONFIG_HOME}/nvm")"
+# [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+```
+
+Uncomment the block matching your nvm installation method. Without the `~/.zshenv` entry, Mason will fail to install all npm-based tools with `ENOENT: npm not found`.
+
+If Mason installations already failed, reopen Neovim and run `:MasonToolsInstall` to retry.
 
 ## Installation
 
