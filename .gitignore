@@ -1,7 +1,5 @@
-# Lazy.nvim lock file (regenerated on plugin install/update)
-# Uncomment the line below if you prefer to pin exact versions via git:
-# !lazy-lock.json
-lazy-lock.json
+# Lazy.nvim lock file — tracked to pin plugin versions across machines.
+# Run :Lazy update to refresh, then commit the updated lock file.
 
 # Plugin data (managed by Lazy.nvim at runtime)
 plugin/
