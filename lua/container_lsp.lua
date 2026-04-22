@@ -133,13 +133,19 @@ end
 -- Just Works. Projects that violate the convention drop a ``.nvim.lua``
 -- with explicit ``setup({...})`` calls — same escape hatch as before.
 
--- Toolchain templates: marker files that identify a stack, and the
+-- Toolchain templates: marker files that identify a stack, the
 -- LSP servers (plus their per-container cmd) to route if the stack
--- is present in a service dir.
+-- is present, the filetypes each stack owns, and the command prefix
+-- for invoking PROJECT-CUSTOM LSPs (bin/lsp-*) in the stack's
+-- preferred interpreter. ``python_cmd`` lets us reach straight for
+-- the project's .venv/bin/python3 so we skip uv's bytecode-
+-- recompile overhead on every LSP start.
 local TOOLCHAIN_TEMPLATES = {
   {
     name = "node",
     markers = { "package.json" },
+    filetypes = { "javascript", "typescript", "vue", "javascriptreact", "typescriptreact" },
+    custom_cmd = { "node" },
     servers = {
       vtsls = { "npx", "vtsls", "--stdio" },
       volar = { "npx", "vue-language-server", "--stdio" },
@@ -151,6 +157,13 @@ local TOOLCHAIN_TEMPLATES = {
   {
     name = "python",
     markers = { "pyproject.toml", "requirements.txt", "setup.py" },
+    filetypes = { "python" },
+    -- Reach for the uv-managed venv directly. uv places it at
+    -- `<service>/.venv/` when you run `uv sync`. Falling back to a
+    -- plain ``python3`` on the container PATH keeps non-uv projects
+    -- working; see ``resolve_custom_cmd`` below.
+    custom_cmd = { ".venv/bin/python3" },
+    custom_cmd_fallback = { "python3" },
     servers = {
       basedpyright = { "basedpyright-langserver", "--stdio" },
       ruff = { "ruff", "server", "--preview" },
@@ -192,6 +205,76 @@ local function match_toolchain(service_dir)
   return nil
 end
 
+-- Resolve the interpreter prefix for project-custom LSPs. The first
+-- ``custom_cmd`` entry may be a relative path into the service dir
+-- (e.g. ``.venv/bin/python3``); if that file exists we use it,
+-- otherwise we fall back to ``custom_cmd_fallback``. This lets uv-
+-- and non-uv-managed Python projects share the same template.
+local function resolve_custom_cmd(template, service_dir)
+  if template.custom_cmd and #template.custom_cmd > 0 then
+    local first = template.custom_cmd[1]
+    -- Relative path to something in the service dir → probe it.
+    if first and not first:match("^/") and first:match("/") then
+      if has_file(service_dir, first) then
+        return template.custom_cmd
+      end
+      return template.custom_cmd_fallback or template.custom_cmd
+    end
+    return template.custom_cmd
+  end
+  return { "sh", "-c" }
+end
+
+-- Scan ``<service_dir>/bin/`` for executable files matching
+-- ``lsp-<name>`` and register each as a project-custom LSP. Server
+-- naming: ``custom_<project>_<service>_<name>`` to avoid collisions
+-- across projects sharing nvim session state. Filetypes are
+-- inherited from the enclosing service's toolchain template. The
+-- actual cmd is routed through the container_lsp wrapper (installed
+-- on first ``route`` call) so these LSPs run inside the service's
+-- container just like the standard ones.
+local function register_custom_lsps(project_name, service_name, service_dir, container, template)
+  local bin_dir = service_dir .. "/bin"
+  if vim.fn.isdirectory(bin_dir) ~= 1 then return end
+
+  local interp = resolve_custom_cmd(template, service_dir)
+  local safe_project = project_name:gsub("[^%w]", "_")
+  local safe_service = service_name:gsub("[^%w]", "_")
+
+  for _, entry in ipairs(vim.fn.readdir(bin_dir)) do
+    local rule = entry:match("^lsp%-(.+)$")
+    if rule and vim.fn.executable(bin_dir .. "/" .. entry) == 1 then
+      local safe_rule = rule:gsub("[^%w]", "_")
+      local server_name = "custom_" .. safe_project .. "_" .. safe_service .. "_" .. safe_rule
+
+      -- Route via the docker wrapper. The cmd that lands in
+      -- ``overrides`` is: docker exec -i <container> <interp>
+      -- <script>. Path is relative to the container's working_dir,
+      -- which Compose-convention projects set to the service dir
+      -- (e.g. ``/.../backend``) — so we just say ``bin/<entry>``,
+      -- not ``<service>/bin/<entry>``.
+      local cmd = vim.list_extend({}, interp)
+      table.insert(cmd, "bin/" .. entry)
+      M.route(server_name, container, (table.unpack or unpack)(cmd))
+
+      -- Register the server config with Neovim's native lsp API.
+      -- ``cmd`` here is a never-runs placeholder — the vim.lsp.start
+      -- wrapper (installed above by ``M.route``) replaces it with
+      -- the docker-routed cmd before spawn, so whatever we put here
+      -- never actually gets exec'd. Uses 0.11+ API: vim.lsp.config
+      -- + vim.lsp.enable.
+      if vim.lsp.config and vim.lsp.enable then
+        vim.lsp.config(server_name, {
+          cmd = { "container-lsp-placeholder" },
+          filetypes = template.filetypes,
+          root_markers = { "pyproject.toml", "package.json", "docker-compose.yml" },
+        })
+        vim.lsp.enable(server_name)
+      end
+    end
+  end
+end
+
 --- Walk up from the starting directory (or ``cwd`` by default)
 --- looking for a compose file, then scan its subdirs for toolchain
 --- markers and route the matching LSPs to the corresponding
@@ -222,6 +305,11 @@ function M.auto_discover(opts)
           for server_name, cmd in pairs(toolchain.servers) do
             M.route(server_name, container, (table.unpack or unpack)(cmd))
           end
+          -- Project-custom LSPs: any ``<service>/bin/lsp-<name>``
+          -- executable becomes an auto-registered LSP named
+          -- ``custom_<project>_<service>_<name>``. Filetypes inherited
+          -- from the toolchain template; cmd routed through docker.
+          register_custom_lsps(project_name, entry, service_dir, container, toolchain)
         end
       end
     end
