@@ -113,4 +113,119 @@ function M.setup(routes)
   end
 end
 
+-- --- Convention-based auto-discovery --------------------------------
+--
+-- Most containerized projects follow a simple shape:
+--
+--   - ``docker-compose.yml`` at the project root.
+--   - Top-level subdirectories are services (``frontend/``,
+--     ``backend/``, ``worker/``, …). The directory name IS the
+--     compose service name.
+--   - Each service dir contains a toolchain marker:
+--     ``package.json`` → Node-based service; ``pyproject.toml`` /
+--     ``requirements.txt`` / ``setup.py`` → Python-based service.
+--   - Compose's default container naming applies:
+--     ``${project_basename}-${service}-1``.
+--
+-- Given those assumptions, we can wire the right LSP-to-container
+-- mappings without any project-local Lua. Call ``auto_discover()``
+-- once from the global config; any project following the convention
+-- Just Works. Projects that violate the convention drop a ``.nvim.lua``
+-- with explicit ``setup({...})`` calls — same escape hatch as before.
+
+-- Toolchain templates: marker files that identify a stack, and the
+-- LSP servers (plus their per-container cmd) to route if the stack
+-- is present in a service dir.
+local TOOLCHAIN_TEMPLATES = {
+  {
+    name = "node",
+    markers = { "package.json" },
+    servers = {
+      vtsls = { "npx", "vtsls", "--stdio" },
+      volar = { "npx", "vue-language-server", "--stdio" },
+      vue_ls = { "npx", "vue-language-server", "--stdio" },
+      tailwindcss = { "npx", "tailwindcss-language-server", "--stdio" },
+      eslint = { "npx", "vscode-eslint-language-server", "--stdio" },
+    },
+  },
+  {
+    name = "python",
+    markers = { "pyproject.toml", "requirements.txt", "setup.py" },
+    servers = {
+      basedpyright = { "basedpyright-langserver", "--stdio" },
+      ruff = { "ruff", "server", "--preview" },
+    },
+  },
+}
+
+local COMPOSE_FILENAMES = {
+  "docker-compose.yml",
+  "docker-compose.yaml",
+  "docker-compose.override.yml",
+  "compose.yml",
+  "compose.yaml",
+}
+
+local function has_file(dir, name)
+  return vim.uv.fs_stat(dir .. "/" .. name) ~= nil
+end
+
+local function find_project_root(start)
+  local dir = start or vim.fn.getcwd()
+  while dir ~= "" and dir ~= "/" do
+    for _, name in ipairs(COMPOSE_FILENAMES) do
+      if has_file(dir, name) then return dir end
+    end
+    local parent = vim.fn.fnamemodify(dir, ":h")
+    if parent == dir then break end
+    dir = parent
+  end
+  return nil
+end
+
+local function match_toolchain(service_dir)
+  for _, template in ipairs(TOOLCHAIN_TEMPLATES) do
+    for _, marker in ipairs(template.markers) do
+      if has_file(service_dir, marker) then return template end
+    end
+  end
+  return nil
+end
+
+--- Walk up from the starting directory (or ``cwd`` by default)
+--- looking for a compose file, then scan its subdirs for toolchain
+--- markers and route the matching LSPs to the corresponding
+--- containers. Fully idempotent — subsequent explicit
+--- ``setup()``/``route()`` calls overwrite the discovered entries if
+--- the user needs a different cmd or container for a particular
+--- server.
+---
+--- Options:
+---   - ``root`` (string, optional): start the walk here instead of cwd.
+---   - ``project_name`` (string, optional): use this for the compose
+---     project prefix. Defaults to the basename of the directory
+---     containing the compose file.
+function M.auto_discover(opts)
+  opts = opts or {}
+  local root = opts.root or find_project_root()
+  if not root then return end
+
+  local project_name = opts.project_name or vim.fn.fnamemodify(root, ":t")
+
+  for _, entry in ipairs(vim.fn.readdir(root)) do
+    if entry:sub(1, 1) ~= "." and entry:sub(1, 1) ~= "_" then
+      local service_dir = root .. "/" .. entry
+      if vim.fn.isdirectory(service_dir) == 1 then
+        local toolchain = match_toolchain(service_dir)
+        if toolchain then
+          local container = project_name .. "-" .. entry .. "-1"
+          for server_name, cmd in pairs(toolchain.servers) do
+            M.route(server_name, container, (table.unpack or unpack)(cmd))
+          end
+        end
+      end
+    end
+  end
+end
+
 return M
