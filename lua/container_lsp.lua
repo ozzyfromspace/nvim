@@ -23,12 +23,141 @@
 
 local M = {}
 
--- server_name → { "docker", "exec", "-i", container, ...cmd }
+-- server_name → { container = <name>, cmd = { "docker", "exec", "-i", container, ...cmd } }
+--
+-- Container is kept separately from the cmd because the restart path
+-- needs it to probe container state (`docker inspect --format
+-- {{.State.Running}} <container>`) before burning a retry attempt.
 local overrides = {}
 local installed = false
 
+-- Auto-reconnect state.
+--
+-- The retry counter itself is threaded through `schedule_restart` as
+-- the `attempt` parameter — one chain per on_exit invocation, growing
+-- until it either hits the cap or succeeds (at which point
+-- `vim.lsp.start` takes over and the chain terminates naturally).
+-- A future on_exit from the same server starts a fresh chain at
+-- attempt=1, so a transient container bounce that recovers leaves no
+-- residual state behind and the next bounce gets a full retry budget.
+--
+-- `probe_cooldown_until` prevents a thundering herd if multiple
+-- clients for the same container die simultaneously (e.g. vtsls +
+-- volar + tailwindcss all routed into `cubic-forms-frontend-1`). When
+-- the first sibling probes and finds the container still down, every
+-- other sibling would otherwise fire its own `docker inspect` in
+-- parallel. Stamping a short cooldown per container makes siblings
+-- short-circuit until the first one succeeds or the cooldown expires.
+local probe_cooldown_until = {}
+
+local MAX_RESTART_ATTEMPTS = 5
+local BASE_RESTART_DELAY_MS = 1500
+local MAX_RESTART_DELAY_MS = 15000
+local CONTAINER_PROBE_COOLDOWN_MS = 500
+
 local function docker_cmd(container, ...)
   return vim.list_extend({ "docker", "exec", "-i", container }, { ... })
+end
+
+--- Return true iff `docker inspect` reports the container is in the
+--- "running" state right now. Called synchronously from within a
+--- deferred timer callback — `vim.fn.system` is fine there (we're not
+--- on the main loop's render critical path). `pcall` around everything
+--- so a rogue docker CLI exit doesn't propagate into Neovim.
+local function probe_container_running(container)
+  if not container or container == "" then return false end
+  local now = vim.uv.hrtime() / 1e6
+  local until_ts = probe_cooldown_until[container]
+  if until_ts and now < until_ts then
+    -- Another sibling already probed recently and got "not running".
+    -- Don't hammer docker with parallel inspects.
+    return false
+  end
+  local ok, output = pcall(vim.fn.system, {
+    "docker",
+    "inspect",
+    "--format",
+    "{{.State.Running}}",
+    container,
+  })
+  if not ok then return false end
+  if vim.v.shell_error ~= 0 then
+    -- "No such container" or daemon not reachable — treat as "not running".
+    probe_cooldown_until[container] = now + CONTAINER_PROBE_COOLDOWN_MS
+    return false
+  end
+  local running = vim.trim(output or "") == "true"
+  if not running then
+    probe_cooldown_until[container] = now + CONTAINER_PROBE_COOLDOWN_MS
+  end
+  return running
+end
+
+--- Schedule a delayed `vim.lsp.start(config)` after a routed LSP dies.
+---
+--- The delay matters because the usual trigger — `docker compose up -d
+--- --force-recreate` during `make link-cx` / `make unlink-cx` /
+--- `dev-reload-types` / a `pnpm add`-driven watcher bounce — tears the
+--- container down and brings a new one up. If we fire too early the
+--- new `docker exec` races docker's container-not-yet-ready state and
+--- fails instantly, burning a retry. The container-running probe is
+--- what actually gates progress: each tick we check if the container
+--- is back, and if not we schedule another probe with exponential
+--- backoff (1.5s → 3s → 6s → 12s → 15s cap) until the attempt cap is
+--- reached. The attempt counter resets on a successful `LspAttach`,
+--- so a container that comes back up and accepts a connection gets a
+--- clean slate for the next bounce; a container that stays broken
+--- (image misconfig, LSP binary missing) hits the cap and surfaces
+--- one WARN notification instead of pegging CPU forever.
+local function schedule_restart(config, attempt)
+  attempt = attempt or 1
+  if not config or not config.name then return end
+  local override = overrides[config.name]
+  if not override then return end  -- user unrouted the server since last start
+
+  if attempt > MAX_RESTART_ATTEMPTS then
+    vim.schedule(function()
+      vim.notify(
+        "[container_lsp] "
+          .. config.name
+          .. " could not reattach after "
+          .. MAX_RESTART_ATTEMPTS
+          .. " attempts (container `"
+          .. (override.container or "?")
+          .. "` not reachable). Run `:LspStart` or `:e` the buffer once the container is back.",
+        vim.log.levels.WARN
+      )
+    end)
+    return
+  end
+
+  -- Exponential backoff, capped. First retry fires quickly (~1.5s) to
+  -- cover the fast case (a force-recreate that's almost done); later
+  -- retries back off to cover the slow case (docker pulling an image,
+  -- a long-running install, a container that needs manual fixing).
+  local delay = math.min(
+    BASE_RESTART_DELAY_MS * (2 ^ (attempt - 1)),
+    MAX_RESTART_DELAY_MS
+  )
+
+  vim.defer_fn(function()
+    -- Re-read override: user may have called `.route()` again with a
+    -- different container between the exit and the probe.
+    local current_override = overrides[config.name]
+    if not current_override then return end
+
+    if current_override.container
+       and not probe_container_running(current_override.container) then
+      -- Container not up yet — don't waste a docker exec on it.
+      return schedule_restart(config, attempt + 1)
+    end
+
+    -- Container reports running. Route back through our wrapped
+    -- `vim.lsp.start` so the docker override is re-applied. The
+    -- wrapper's `_container_lsp_wrapped` flag prevents us from
+    -- stacking on_exit callbacks on every retry.
+    pcall(vim.lsp.start, config)
+  end, delay)
 end
 
 -- Install the vim.lsp.start wrapper + notify filters exactly once.
@@ -59,8 +188,14 @@ local function install_wrapper()
   vim.lsp.start = function(config, opts)
     if config and config.name then
       local override = overrides[config.name]
-      if override then
-        config.cmd = override
+      if override and not config._container_lsp_wrapped then
+        -- Flag to prevent stacking overrides on every auto-restart.
+        -- The auto-restart path re-enters this wrapper with the same
+        -- `config` table; without this flag, every pass would wrap
+        -- on_exit, before_init, and handlers in a fresh closure,
+        -- leading to O(n) memory + O(n) duplicate message handlers.
+        config._container_lsp_wrapped = true
+        config.cmd = override.cmd
         -- Null processId so the container LSP doesn't try to monitor
         -- a host PID that doesn't exist inside the container.
         local orig_before_init = config.before_init
@@ -79,10 +214,43 @@ local function install_wrapper()
             return vim.lsp.handlers["window/showMessage"](err, result, ctx, conf)
           end,
         })
+        -- Auto-restart on unexpected exit. Only arms for routed
+        -- servers; non-routed LSPs (host-side) keep default
+        -- behavior. See `schedule_restart` for the backoff /
+        -- probe / cap logic.
+        local orig_on_exit = config.on_exit
+        config.on_exit = function(code, signal, client_id)
+          if orig_on_exit then
+            pcall(orig_on_exit, code, signal, client_id)
+          end
+          -- Clean exit (code 0, no signal) typically means the user
+          -- ran `:LspStop` — respect that and don't auto-restart.
+          -- Everything else (non-zero code from `docker exec` when
+          -- the container is killed, or any signal) is treated as an
+          -- unexpected death that warrants reattachment.
+          local clean = (code == 0) and (signal == nil or signal == 0)
+          if clean then return end
+          schedule_restart(config, 1)
+        end
       end
     end
     return _lsp_start(config, opts)
   end
+
+  -- When a routed client successfully attaches, clear any stale
+  -- "container not running" cooldown for its container. The cooldown
+  -- exists to stop parallel siblings from hammering `docker inspect`
+  -- during a recreate; once ANY sibling has attached successfully we
+  -- know the container is up, so fresh probes should not be skipped.
+  vim.api.nvim_create_autocmd("LspAttach", {
+    group = vim.api.nvim_create_augroup("container_lsp_reattach", { clear = true }),
+    callback = function(args)
+      local client = vim.lsp.get_client_by_id(args.data.client_id)
+      if client and overrides[client.name] then
+        probe_cooldown_until[(overrides[client.name] or {}).container or ""] = nil
+      end
+    end,
+  })
 end
 
 --- Declare that LSP `server_name` should run inside `container` via
@@ -90,7 +258,10 @@ end
 ---
 ---     require("container_lsp").route("vtsls", "frontend-1", "npx", "vtsls", "--stdio")
 function M.route(server_name, container, ...)
-  overrides[server_name] = docker_cmd(container, ...)
+  overrides[server_name] = {
+    container = container,
+    cmd = docker_cmd(container, ...),
+  }
   install_wrapper()
 end
 
